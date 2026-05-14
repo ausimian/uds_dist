@@ -22,7 +22,7 @@ defmodule UdsDist.MixProject do
   end
 
   def application do
-    [extra_applications: [:kernel]]
+    [extra_applications: [:kernel], env: [backlog: 5]]
   end
 
   defp description do

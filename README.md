@@ -48,6 +48,16 @@ A node named `myapp@host` then listens at the abstract path `\0myapp/myapp`.
 
 Configuring an abstract `socket_dir` on a non-Linux platform raises at `listen/1` or `setup/5` time. There is no automatic fallback.
 
+### Listen backlog
+
+The kernel listen backlog defaults to 5 and can be overridden:
+
+```elixir
+config :uds_dist, backlog: 128
+```
+
+The value is read at `listen/1` time, so setting it in `config/runtime.exs` of a release is sufficient.
+
 ## Release integration
 
 `rel/vm.args.eex`:
