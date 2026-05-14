@@ -23,7 +23,8 @@ driven by application configuration (the `:socket_dir` value on the
 -export([listen/1, accept/1, accept_connection/5,
          setup/5, close/1, select/1, address/0]).
 -export([setopts/2, getopts/2]).
--export([accept_loop/2, accept_supervisor/6, setup_supervisor/5]).
+-export([accept_loop/2, accept_handshake/2,
+         accept_supervisor/6, setup_supervisor/5]).
 
 %% Exported for testing.
 -export([resolve_path/1, strip_host/1, abstract_supported/0]).
@@ -34,7 +35,7 @@ driven by application configuration (the `:socket_dir` value on the
 
 -define(ERL_DIST_VER, 6).
 -define(SPAWN_OPTS, [{message_queue_data, off_heap}, {fullsweep_after, 0}]).
--define(BACKLOG, 5).
+-define(BACKLOG, 128).
 
 %%% =====================================================================
 %%% Distribution callbacks
@@ -199,20 +200,30 @@ maybe_unlink(Path) ->
 accept_loop(Kernel, ListenSocket) ->
     case socket:accept(ListenSocket) of
         {ok, Socket} ->
-            DistCtrl = spawn_dist_controller(Socket),
-            Kernel ! {accept, self(), DistCtrl, local, stream},
-            receive
-                {Kernel, controller, SupervisorPid} ->
-                    call_controller(DistCtrl, {supervisor, SupervisorPid}),
-                    SupervisorPid ! {self(), controller};
-                {Kernel, unsupported_protocol} ->
-                    exit(unsupported_protocol)
-            end,
+            %% Hand the handshake to a per-connection helper so the
+            %% loop can immediately re-enter socket:accept/1. Without
+            %% this the loop is serialised by the kernel handshake
+            %% round-trip and the listen backlog can overflow under
+            %% bursts of concurrent dialers.
+            _ = spawn_opt(?MODULE, accept_handshake, [Kernel, Socket],
+                          [{priority, max} | ?SPAWN_OPTS]),
             accept_loop(Kernel, ListenSocket);
         {error, closed} ->
             exit(closing_connection);
         Error ->
             exit(Error)
+    end.
+
+-doc false.
+accept_handshake(Kernel, Socket) ->
+    DistCtrl = spawn_dist_controller(Socket),
+    Kernel ! {accept, self(), DistCtrl, local, stream},
+    receive
+        {Kernel, controller, SupervisorPid} ->
+            call_controller(DistCtrl, {supervisor, SupervisorPid}),
+            SupervisorPid ! {self(), controller};
+        {Kernel, unsupported_protocol} ->
+            exit(unsupported_protocol)
     end.
 
 -doc false.
