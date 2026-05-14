@@ -1,16 +1,24 @@
-%%% Erlang distribution over Unix Domain Sockets via the :socket module.
-%%%
-%%% Modelled on erl_uds_dist (lib/kernel/examples/erl_uds_dist) but uses the
-%%% modern socket NIF instead of gen_tcp, hardcodes distribution protocol
-%%% version 6, supports both filesystem and Linux abstract sockets, and
-%%% resolves socket paths from the application environment instead of
-%%% deriving them directly from the cwd-relative node name.
-%%%
-%%% Path resolution:
-%%%   application:get_env(uds_dist, socket_dir, ".") + node-name + ".sock"
-%%%   except when socket_dir starts with "@" — then the rest is the abstract
-%%%   namespace prefix and no ".sock" suffix is added.
 -module(uds_dist).
+-moduledoc """
+Erlang distribution over Unix domain sockets via the `socket` module.
+
+See the [README](readme.html) for configuration, release integration,
+platform support, and local development notes.
+
+This module implements the callbacks OTP requires of a custom
+distribution protocol (`listen/1`, `accept/1`, `accept_connection/5`,
+`setup/5`, `close/1`, `select/1`, `address/0`, plus the optional
+`setopts/2`, `getopts/2`). It is loaded by passing `-proto_dist uds` to
+the BEAM at boot; the callbacks are invoked by the kernel's
+distribution machinery, not by user code, and are not documented here.
+
+The implementation is modelled on the `erl_uds_dist` example in
+`lib/kernel/examples` with several simplifications: pure-Erlang via the
+`socket` NIF rather than `gen_tcp`, distribution protocol version 6
+only, abstract namespace support on Linux, and socket-path resolution
+driven by application configuration (the `:socket_dir` value on the
+`:uds_dist` application environment).
+""".
 
 -export([listen/1, accept/1, accept_connection/5,
          setup/5, close/1, select/1, address/0]).
@@ -32,12 +40,15 @@
 %%% Distribution callbacks
 %%% =====================================================================
 
+-doc false.
 select(_NodeName) ->
     true.
 
+-doc false.
 address() ->
     net_address(undefined).
 
+-doc false.
 listen(NameAtom) ->
     Path = resolve_path(atom_to_list(NameAtom)),
     case open_and_bind(Path) of
@@ -47,20 +58,24 @@ listen(NameAtom) ->
             Error
     end.
 
+-doc false.
 accept(ListenSocket) ->
     spawn_opt(?MODULE, accept_loop, [self(), ListenSocket],
               [link, {priority, max} | ?SPAWN_OPTS]).
 
+-doc false.
 accept_connection(AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
     spawn_opt(?MODULE, accept_supervisor,
               [self(), AcceptPid, DistCtrl, MyNode, Allowed, SetupTime],
               dist_util:net_ticker_spawn_options()).
 
+-doc false.
 setup(Node, Type, MyNode, _LongOrShortNames, SetupTime) ->
     spawn_opt(?MODULE, setup_supervisor,
               [self(), Node, Type, MyNode, SetupTime],
               dist_util:net_ticker_spawn_options()).
 
+-doc false.
 close(ListenSocket) ->
     case socket:sockname(ListenSocket) of
         {ok, #{family := local, path := Path}} ->
@@ -70,9 +85,11 @@ close(ListenSocket) ->
     end,
     socket:close(ListenSocket).
 
+-doc false.
 setopts(_ListenSocket, _Options) ->
     ok.
 
+-doc false.
 getopts(_ListenSocket, _Options) ->
     {ok, []}.
 
@@ -83,6 +100,7 @@ getopts(_ListenSocket, _Options) ->
 %% Resolve a node-name-without-host to a sockaddr_un path (binary). Reads
 %% the configured socket_dir from the application environment. A leading
 %% "@" on the configured dir selects the Linux abstract namespace.
+-doc false.
 resolve_path(Name) when is_list(Name) ->
     %% Ensure the .app file is loaded so that -uds_dist socket_dir Path
     %% args (resolved into app env at load time) are visible. Releases
@@ -99,12 +117,14 @@ resolve_path(Name) when is_list(Name) ->
             iolist_to_binary(filename:join(Dir, Name ++ ".sock"))
     end.
 
+-doc false.
 abstract_supported() ->
     case os:type() of
         {unix, linux} -> true;
         _ -> false
     end.
 
+-doc false.
 strip_host(Node) when is_atom(Node) ->
     strip_host(atom_to_list(Node));
 strip_host(Node) when is_list(Node) ->
@@ -175,6 +195,7 @@ maybe_unlink(Path) ->
 %%% Accept side
 %%% =====================================================================
 
+-doc false.
 accept_loop(Kernel, ListenSocket) ->
     case socket:accept(ListenSocket) of
         {ok, Socket} ->
@@ -194,6 +215,7 @@ accept_loop(Kernel, ListenSocket) ->
             exit(Error)
     end.
 
+-doc false.
 accept_supervisor(Kernel, AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
     receive
         {AcceptPid, controller} ->
@@ -217,6 +239,7 @@ accept_supervisor(Kernel, AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
 %%% Setup (outbound) side
 %%% =====================================================================
 
+-doc false.
 setup_supervisor(Kernel, Node, Type, MyNode, SetupTime) ->
     Name = strip_host(Node),
     Path = resolve_path(Name),
