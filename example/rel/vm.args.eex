@@ -1,0 +1,5 @@
+## Customize flags given to the VM: http://erlang.org/doc/man/erl.html
+## -mode/-name/-sname/-setcookie are configured via env vars, do not set them here
+
+-proto_dist uds
+-no_epmd

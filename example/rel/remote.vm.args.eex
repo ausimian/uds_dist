@@ -1,0 +1,5 @@
+## Used by `bin/<rel> remote` and `bin/<rel> rpc` — do not set node/cookie here.
+
+-proto_dist uds
+-no_epmd
+-dist_listen false
