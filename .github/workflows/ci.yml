@@ -36,3 +36,31 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
+
+      - name: Build example release
+        working-directory: example
+        run: |
+          mix deps.get
+          MIX_ENV=prod mix release
+
+      - name: Start example daemon
+        working-directory: example/_build/prod/rel/example
+        run: |
+          ./bin/example daemon
+          for _ in $(seq 1 20); do
+            [ -S example.sock ] && exit 0
+            sleep 0.5
+          done
+          echo "example.sock never appeared" >&2
+          exit 1
+
+      - name: RPC into example daemon
+        working-directory: example/_build/prod/rel/example
+        run: |
+          out=$(./bin/example rpc 'IO.puts inspect(Example.hello())')
+          echo "rpc returned: $out"
+          [ "$out" = ":world" ]
+
+      - name: Stop example daemon
+        working-directory: example/_build/prod/rel/example
+        run: ./bin/example stop
