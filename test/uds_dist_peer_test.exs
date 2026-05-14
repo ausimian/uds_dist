@@ -42,6 +42,10 @@ defmodule UdsDistPeerTest do
       :ok = :peer.call(p, :init, :stop, [], 5_000)
 
       :ok = wait_until(fn -> not File.exists?(sock) end, 5_000)
+      # The socket goes away during net_kernel:terminate, but the peer's
+      # controller gen_server only dies once the BEAM port closes —
+      # wait for that before asserting :peer.stop trips an exit.
+      :ok = wait_until(fn -> not Process.alive?(p) end, 5_000)
       catch_exit(:peer.stop(p))
     end
 
