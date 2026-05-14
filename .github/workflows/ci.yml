@@ -36,6 +36,7 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
+      - run: mix test --only stress
 
       - name: Build example release
         working-directory: example
