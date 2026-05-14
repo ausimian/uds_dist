@@ -80,6 +80,143 @@ defmodule UdsDistPeerTest do
     end
   end
 
+  describe "stress" do
+    @describetag :stress
+    @describetag timeout: :timer.minutes(2)
+
+    test "many concurrent rpc.calls multiplex over a single connection", ctx do
+      {:ok, p1, _n1} = start_peer(:stress_rpc_a, ctx.tmp, ctx.ebin)
+      {:ok, p2, n2} = start_peer(:stress_rpc_b, ctx.tmp, ctx.ebin)
+
+      try do
+        true = :peer.call(p1, :net_kernel, :connect_node, [n2])
+
+        n = 500
+
+        results =
+          1..n
+          |> Task.async_stream(
+            fn i ->
+              payload = <<i::32, :crypto.strong_rand_bytes(512)::binary>>
+
+              echoed =
+                :peer.call(p1, :rpc, :call, [n2, :erlang, :byte_size, [payload]])
+
+              {echoed, byte_size(payload)}
+            end,
+            max_concurrency: n,
+            timeout: 60_000,
+            ordered: false
+          )
+          |> Enum.map(fn {:ok, r} -> r end)
+
+        assert length(results) == n
+        assert Enum.all?(results, fn {echoed, expected} -> echoed == expected end)
+      after
+        :peer.stop(p2)
+        :peer.stop(p1)
+      end
+    end
+
+    test "bidirectional traffic spans the 64 KiB frame boundary", ctx do
+      {:ok, p1, n1} = start_peer(:stress_bidir_a, ctx.tmp, ctx.ebin)
+      {:ok, p2, n2} = start_peer(:stress_bidir_b, ctx.tmp, ctx.ebin)
+
+      try do
+        true = :peer.call(p1, :net_kernel, :connect_node, [n2])
+
+        # Cycle below and above 64 KiB so frame lengths exercise both
+        # short and long header paths in the input handler.
+        sizes = Stream.cycle([64, 4_096, 70_000, 200_000]) |> Enum.take(80)
+
+        shoot = fn sender, receiver ->
+          Task.async(fn ->
+            sizes
+            |> Task.async_stream(
+              fn size ->
+                payload = :crypto.strong_rand_bytes(size)
+
+                echoed =
+                  :peer.call(sender, :rpc, :call, [
+                    receiver,
+                    :erlang,
+                    :byte_size,
+                    [payload]
+                  ])
+
+                {echoed, size}
+              end,
+              max_concurrency: 10,
+              timeout: 60_000,
+              ordered: false
+            )
+            |> Enum.map(fn {:ok, r} -> r end)
+          end)
+        end
+
+        a_to_b = shoot.(p1, n2)
+        b_to_a = shoot.(p2, n1)
+
+        results_ab = Task.await(a_to_b, 120_000)
+        results_ba = Task.await(b_to_a, 120_000)
+
+        assert length(results_ab) == length(sizes)
+        assert length(results_ba) == length(sizes)
+        assert Enum.all?(results_ab, fn {echoed, expected} -> echoed == expected end)
+        assert Enum.all?(results_ba, fn {echoed, expected} -> echoed == expected end)
+      after
+        :peer.stop(p2)
+        :peer.stop(p1)
+      end
+    end
+
+    test "many peers connect to a single hub concurrently", ctx do
+      k = 10
+      {:ok, hub, hub_node} = start_peer(:stress_hub, ctx.tmp, ctx.ebin)
+
+      spokes =
+        for i <- 1..k do
+          {:ok, p, n} = start_peer(:"stress_spoke_#{i}", ctx.tmp, ctx.ebin)
+          {p, n}
+        end
+
+      try do
+        # Setup handshake is serialised by the accept loop and the kernel
+        # listen backlog is small (5), so concurrent connects can be
+        # transiently refused. Retry briefly to absorb that backpressure.
+        spokes
+        |> Task.async_stream(
+          fn {p, _n} ->
+            assert connect_with_retry(p, hub_node, 20) == true
+          end,
+          max_concurrency: k,
+          timeout: 30_000
+        )
+        |> Stream.run()
+
+        seen = :peer.call(hub, :erlang, :nodes, [])
+        expected = Enum.map(spokes, fn {_, n} -> n end)
+        assert Enum.sort(seen) == Enum.sort(expected)
+
+        results =
+          spokes
+          |> Task.async_stream(
+            fn {p, _n} ->
+              :peer.call(p, :rpc, :call, [hub_node, :erlang, :node, []])
+            end,
+            max_concurrency: k,
+            timeout: 30_000
+          )
+          |> Enum.map(fn {:ok, r} -> r end)
+
+        assert Enum.all?(results, &(&1 == hub_node))
+      after
+        for {p, _n} <- spokes, do: :peer.stop(p)
+        :peer.stop(hub)
+      end
+    end
+  end
+
   describe "abstract namespace sockets" do
     @describetag :linux_only
 
@@ -127,6 +264,19 @@ defmodule UdsDistPeerTest do
     # Erlang's -App Key Value parser evaluates Value as a term, so a string
     # must look like a quoted literal: "/tmp/foo" → `"\"/tmp/foo\""`.
     (~s("#{s}")) |> to_charlist()
+  end
+
+  defp connect_with_retry(_peer, _target, 0), do: false
+
+  defp connect_with_retry(peer, target, attempts) do
+    case :peer.call(peer, :net_kernel, :connect_node, [target]) do
+      true ->
+        true
+
+      _ ->
+        Process.sleep(50)
+        connect_with_retry(peer, target, attempts - 1)
+    end
   end
 
   defp wait_until(fun, timeout_ms) do

@@ -1,6 +1,11 @@
 ExUnit.start()
 
-case :os.type() do
-  {:unix, :linux} -> :ok
-  _ -> ExUnit.configure(exclude: [:linux_only])
-end
+excludes = [:stress]
+
+excludes =
+  case :os.type() do
+    {:unix, :linux} -> excludes
+    _ -> [:linux_only | excludes]
+  end
+
+ExUnit.configure(exclude: excludes)
