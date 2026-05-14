@@ -18,6 +18,9 @@ The implementation is modelled on the `erl_uds_dist` example in
 only, abstract namespace support on Linux, and socket-path resolution
 driven by application configuration (the `:socket_dir` value on the
 `:uds_dist` application environment).
+
+The listen backlog is read from the `:backlog` application environment
+value at `listen/1` time (default 5).
 """.
 
 -export([listen/1, accept/1, accept_connection/5,
@@ -35,7 +38,7 @@ driven by application configuration (the `:socket_dir` value on the
 
 -define(ERL_DIST_VER, 6).
 -define(SPAWN_OPTS, [{message_queue_data, off_heap}, {fullsweep_after, 0}]).
--define(BACKLOG, 128).
+-define(DEFAULT_BACKLOG, 5).
 
 %%% =====================================================================
 %%% Distribution callbacks
@@ -140,7 +143,8 @@ open_and_bind(Path) ->
     {ok, S} = socket:open(local, stream, default),
     case socket:bind(S, sockaddr(Path)) of
         ok ->
-            ok = socket:listen(S, ?BACKLOG),
+            Backlog = application:get_env(uds_dist, backlog, ?DEFAULT_BACKLOG),
+            ok = socket:listen(S, Backlog),
             {ok, S};
         {error, eaddrinuse} ->
             socket:close(S),

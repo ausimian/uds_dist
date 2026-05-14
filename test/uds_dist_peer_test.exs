@@ -175,9 +175,10 @@ defmodule UdsDistPeerTest do
     end
 
     test "many peers connect to a single hub concurrently", ctx do
-      # Far in excess of the original BACKLOG=5; relies on the accept
-      # loop spawning per-connection handshake helpers so it can drain
-      # the kernel listen queue without waiting on each setup.
+      # Peers run with backlog=128 (see start_peer/3). The accept loop
+      # spawns per-connection handshake helpers and re-enters accept
+      # immediately, so it can drain the kernel listen queue without
+      # waiting on each setup.
       k = 50
       {:ok, hub, hub_node} = start_peer(:stress_hub, ctx.tmp, ctx.ebin)
 
@@ -259,7 +260,10 @@ defmodule UdsDistPeerTest do
         ebin,
         ~c"-uds_dist",
         ~c"socket_dir",
-        quote_erl_string(socket_dir)
+        quote_erl_string(socket_dir),
+        ~c"-uds_dist",
+        ~c"backlog",
+        ~c"128"
       ]
     })
   end
