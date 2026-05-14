@@ -17,7 +17,8 @@ defmodule UdsDist.MixProject do
       description: description(),
       package: package(),
       docs: docs(),
-      deps: deps()
+      deps: deps(),
+      test_coverage: [summary: [threshold: 70]]
     ]
   end
 
