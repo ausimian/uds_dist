@@ -1,0 +1,11 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+uds_dist-*.tar
+/tmp/
+.elixir_ls/
+.lexical/
