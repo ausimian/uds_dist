@@ -175,7 +175,10 @@ defmodule UdsDistPeerTest do
     end
 
     test "many peers connect to a single hub concurrently", ctx do
-      k = 10
+      # Far in excess of the original BACKLOG=5; relies on the accept
+      # loop spawning per-connection handshake helpers so it can drain
+      # the kernel listen queue without waiting on each setup.
+      k = 50
       {:ok, hub, hub_node} = start_peer(:stress_hub, ctx.tmp, ctx.ebin)
 
       spokes =
@@ -185,13 +188,10 @@ defmodule UdsDistPeerTest do
         end
 
       try do
-        # Setup handshake is serialised by the accept loop and the kernel
-        # listen backlog is small (5), so concurrent connects can be
-        # transiently refused. Retry briefly to absorb that backpressure.
         spokes
         |> Task.async_stream(
           fn {p, _n} ->
-            assert connect_with_retry(p, hub_node, 20) == true
+            assert :peer.call(p, :net_kernel, :connect_node, [hub_node]) == true
           end,
           max_concurrency: k,
           timeout: 30_000
@@ -268,19 +268,6 @@ defmodule UdsDistPeerTest do
     # Erlang's -App Key Value parser evaluates Value as a term, so a string
     # must look like a quoted literal: "/tmp/foo" → `"\"/tmp/foo\""`.
     (~s("#{s}")) |> to_charlist()
-  end
-
-  defp connect_with_retry(_peer, _target, 0), do: false
-
-  defp connect_with_retry(peer, target, attempts) do
-    case :peer.call(peer, :net_kernel, :connect_node, [target]) do
-      true ->
-        true
-
-      _ ->
-        Process.sleep(50)
-        connect_with_retry(peer, target, attempts - 1)
-    end
   end
 
   defp wait_until(fun, timeout_ms) do
