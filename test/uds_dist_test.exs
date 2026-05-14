@@ -96,6 +96,26 @@ defmodule UdsDistTest do
     end
   end
 
+  describe "setopts/2 and getopts/2" do
+    test "are no-ops with the expected return shapes" do
+      assert :uds_dist.setopts(:fake_listen, []) == :ok
+      assert :uds_dist.getopts(:fake_listen, []) == {:ok, []}
+    end
+  end
+
+  describe "accept/1" do
+    test "spawns an acceptor that exits when the listen socket is closed", %{tmp: _tmp} do
+      Process.flag(:trap_exit, true)
+      {:ok, {listen, _, _}} = :uds_dist.listen(:acceptor)
+      pid = :uds_dist.accept(listen)
+      assert is_pid(pid)
+
+      ref = Process.monitor(pid)
+      :ok = :uds_dist.close(listen)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
+    end
+  end
+
   describe "listen/1 and close/1" do
     test "creates a socket file under socket_dir and removes it on close", %{tmp: tmp} do
       {:ok, {listen, addr, creation}} = :uds_dist.listen(:smoke)

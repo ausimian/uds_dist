@@ -26,8 +26,8 @@ defmodule UdsDistPeerTest do
         assert File.exists?(Path.join(ctx.tmp, "alpha.sock"))
         assert File.exists?(Path.join(ctx.tmp, "beta.sock"))
       after
-        :peer.stop(p2)
-        :peer.stop(p1)
+        stop_peer(p2)
+        stop_peer(p1)
       end
     end
 
@@ -62,7 +62,7 @@ defmodule UdsDistPeerTest do
       # the stale file (probe connect fails) and unlinks it before retrying.
       {:ok, p2, _} = start_peer(:reaper, ctx.tmp, ctx.ebin)
       assert File.exists?(sock)
-      :peer.stop(p2)
+      stop_peer(p2)
     end
 
     test "rpc round-trips a large binary", ctx do
@@ -78,8 +78,8 @@ defmodule UdsDistPeerTest do
 
         assert echoed == byte_size(payload)
       after
-        :peer.stop(p2)
-        :peer.stop(p1)
+        stop_peer(p2)
+        stop_peer(p1)
       end
     end
   end
@@ -117,8 +117,8 @@ defmodule UdsDistPeerTest do
         assert length(results) == n
         assert Enum.all?(results, fn {echoed, expected} -> echoed == expected end)
       after
-        :peer.stop(p2)
-        :peer.stop(p1)
+        stop_peer(p2)
+        stop_peer(p1)
       end
     end
 
@@ -169,8 +169,8 @@ defmodule UdsDistPeerTest do
         assert Enum.all?(results_ab, fn {echoed, expected} -> echoed == expected end)
         assert Enum.all?(results_ba, fn {echoed, expected} -> echoed == expected end)
       after
-        :peer.stop(p2)
-        :peer.stop(p1)
+        stop_peer(p2)
+        stop_peer(p1)
       end
     end
 
@@ -216,8 +216,8 @@ defmodule UdsDistPeerTest do
 
         assert Enum.all?(results, &(&1 == hub_node))
       after
-        for {p, _n} <- spokes, do: :peer.stop(p)
-        :peer.stop(hub)
+        for {p, _n} <- spokes, do: stop_peer(p)
+        stop_peer(hub)
       end
     end
   end
@@ -238,34 +238,78 @@ defmodule UdsDistPeerTest do
         # No filesystem entries should exist for either socket
         refute File.exists?("/tmp/" <> ns)
       after
-        :peer.stop(p2)
-        :peer.stop(p1)
+        stop_peer(p2)
+        stop_peer(p1)
       end
     end
   end
 
   defp start_peer(name, socket_dir, ebin) do
-    :peer.start_link(%{
-      name: name,
-      connection: :standard_io,
-      args: [
-        ~c"-proto_dist",
-        ~c"uds",
-        ~c"-no_epmd",
-        ~c"-dist_listen",
-        ~c"true",
-        ~c"-setcookie",
-        ~c"uds_dist_test_cookie",
-        ~c"-pa",
-        ebin,
-        ~c"-uds_dist",
-        ~c"socket_dir",
-        quote_erl_string(socket_dir),
-        ~c"-uds_dist",
-        ~c"backlog",
-        ~c"128"
-      ]
-    })
+    {:ok, p, node} =
+      :peer.start_link(%{
+        name: name,
+        connection: :standard_io,
+        args: [
+          ~c"-proto_dist",
+          ~c"uds",
+          ~c"-no_epmd",
+          ~c"-dist_listen",
+          ~c"true",
+          ~c"-setcookie",
+          ~c"uds_dist_test_cookie",
+          ~c"-pa",
+          ebin,
+          ~c"-uds_dist",
+          ~c"socket_dir",
+          quote_erl_string(socket_dir),
+          ~c"-uds_dist",
+          ~c"backlog",
+          ~c"128"
+        ]
+      })
+
+    enable_peer_cover(p, name)
+    {:ok, p, node}
+  end
+
+  # See test_helper.exs for the rationale. We arm cover on the peer here and
+  # flush before :peer.stop in stop_peer/1 so the file is written while the
+  # peer beam is still alive.
+  defp enable_peer_cover(p, name) do
+    cover_dir = Application.get_env(:uds_dist, :peer_cover_dir)
+
+    if is_binary(cover_dir) and Process.whereis(:cover_server) != nil do
+      _ = :peer.call(p, :cover, :start, [])
+      _ = :peer.call(p, :cover, :compile_beam, [:uds_dist])
+
+      file =
+        Path.join(cover_dir, "#{name}_#{System.unique_integer([:positive])}.coverdata")
+
+      Process.put({:peer_cover_file, p}, file)
+    end
+
+    :ok
+  end
+
+  defp stop_peer(p) do
+    flush_peer_cover(p)
+    :peer.stop(p)
+  end
+
+  defp flush_peer_cover(p) do
+    case Process.delete({:peer_cover_file, p}) do
+      nil ->
+        :ok
+
+      file ->
+        try do
+          _ = :peer.call(p, :cover, :export, [to_charlist(file)])
+        catch
+          _, _ -> :ok
+        end
+
+        :ok
+    end
   end
 
   defp quote_erl_string(s) do
