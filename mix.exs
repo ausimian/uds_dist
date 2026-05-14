@@ -1,7 +1,7 @@
 defmodule UdsDist.MixProject do
   use Mix.Project
 
-  @version "1.0.0-rc.1"
+  @version "1.0.0"
   @source_url "https://github.com/ausimian/uds_dist"
 
   def project do
