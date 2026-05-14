@@ -12,7 +12,7 @@ OTP 26 or newer. Erlang distribution protocol version 6 only.
 
 ```elixir
 def deps do
-  [{:uds_dist, "~> 0.1"}]
+  [{:uds_dist, "~> 1.0"}]
 end
 ```
 
