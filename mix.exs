@@ -10,6 +10,8 @@ defmodule UdsDist.MixProject do
       version: System.get_env("VERSION_OVERRIDE", @version),
       language: :erlang,
       elixir: "~> 1.18",
+      compilers: [:elixir_make] ++ Mix.compilers(),
+      make_clean: ["clean"],
       erlc_options: [:debug_info, :warnings_as_errors],
       erlc_paths: ["src"],
       consolidate_protocols: false,
@@ -40,7 +42,7 @@ defmodule UdsDist.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
-      files: ~w(src mix.exs LICENSE CHANGELOG.md RELEASE.md README.md)
+      files: ~w(c_src src Makefile mix.exs LICENSE CHANGELOG.md RELEASE.md README.md)
     ]
   end
 
@@ -55,6 +57,7 @@ defmodule UdsDist.MixProject do
 
   defp deps do
     [
+      {:elixir_make, "~> 0.10.0", runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
       {:publisho, "~> 1.0", only: :dev, runtime: false}

@@ -13,34 +13,43 @@ the BEAM at boot; the callbacks are invoked by the kernel's
 distribution machinery, not by user code, and are not documented here.
 
 The implementation is modelled on the `erl_uds_dist` example in
-`lib/kernel/examples` with several simplifications: pure-Erlang via the
-`socket` NIF rather than `gen_tcp`, distribution protocol version 6
-only, abstract namespace support on Linux, and socket-path resolution
-driven by application configuration (the `:socket_dir` value on the
-`:uds_dist` application environment).
+`lib/kernel/examples` with several simplifications: the `socket` NIF
+rather than `gen_tcp`, distribution protocol version 6 only, abstract
+namespace support on Linux, and socket-path resolution driven by
+application configuration (the `:socket_dir` value on the `:uds_dist`
+application environment), the `UDS_DIST_DIR` environment variable, or a
+host-global path derived from the node name under `/tmp`.
 
-The listen backlog is read from the `:backlog` application environment
-value at `listen/1` time (default 5).
+The listen backlog and trusted-peer UID policy are read from the application
+environment at `listen/1` time. The backlog defaults to 5, while
+`:allowed_uids` defaults to the process's effective UID and also accepts
+`:any` or a list of numeric UIDs. Outbound-only nodes read the same policy
+when they connect.
 """.
 
 -export([listen/1, accept/1, accept_connection/5,
          setup/5, close/1, select/1, address/0]).
 -export([setopts/2, getopts/2]).
--export([accept_loop/2, accept_handshake/2,
+-export([accept_loop/3, accept_handshake/2,
          accept_supervisor/6, setup_supervisor/5]).
 
 %% Exported for testing.
--export([resolve_path/1, strip_host/1, abstract_supported/0]).
+-export([resolve_path/1, configured_allowed_uids/0,
+         strip_host/1, abstract_supported/0]).
 
 -include_lib("kernel/include/net_address.hrl").
 -include_lib("kernel/include/dist.hrl").
 -include_lib("kernel/include/dist_util.hrl").
+-include_lib("kernel/include/file.hrl").
 
 -define(ERL_DIST_VER, 6).
 -define(SPAWN_OPTS, [{message_queue_data, off_heap}, {fullsweep_after, 0}]).
 -define(DEFAULT_BACKLOG, 5).
 -define(LINUX_SUN_PATH_BYTES, 108).
--define(DARWIN_SUN_PATH_BYTES, 104).
+-define(BSD_SUN_PATH_BYTES, 104).
+-define(REJECTION_LOG_INTERVAL_MS, 5000).
+-define(SOCKET_DIR_KEY, {?MODULE, socket_dir}).
+-define(ALLOWED_UIDS_KEY, {?MODULE, allowed_uids}).
 
 %%% =====================================================================
 %%% Distribution callbacks
@@ -56,17 +65,42 @@ address() ->
 
 -doc false.
 listen(NameAtom) ->
-    Path = resolve_path(atom_to_list(NameAtom)),
-    case open_and_bind(Path) of
-        {ok, Listen} ->
-            {ok, {Listen, net_address(sockaddr_to_address(Path)), creation()}};
+    case peer_credentials_supported() of
+        true ->
+            case uds_dist_posix:ensure_loaded() of
+                ok -> do_listen(NameAtom);
+                {error, _} = Error -> Error
+            end;
+        false ->
+            {error, {peer_credentials_unsupported, os:type()}}
+    end.
+
+do_listen(NameAtom) ->
+    Dir = configured_socket_dir(),
+    AllowedUIDs = configured_allowed_uids(),
+    Path = resolve_path(atom_to_list(NameAtom), Dir),
+    case ensure_socket_dir(Dir) of
+        ok ->
+            case open_and_bind(Path) of
+                {ok, Listen} ->
+                    persistent_term:put(?SOCKET_DIR_KEY, Dir),
+                    persistent_term:put(?ALLOWED_UIDS_KEY, AllowedUIDs),
+                    logger:notice(
+                      "uds_dist listening on ~tp with allowed_uids=~tp",
+                      [Path, AllowedUIDs]),
+                    {ok, {Listen, net_address(sockaddr_to_address(Path)),
+                          creation()}};
+                {error, _} = Error ->
+                    Error
+            end;
         {error, _} = Error ->
             Error
     end.
 
 -doc false.
 accept(ListenSocket) ->
-    spawn_opt(?MODULE, accept_loop, [self(), ListenSocket],
+    AllowedUIDs = persistent_term:get(?ALLOWED_UIDS_KEY),
+    spawn_opt(?MODULE, accept_loop, [self(), ListenSocket, AllowedUIDs],
               [link, {priority, max} | ?SPAWN_OPTS]).
 
 -doc false.
@@ -89,7 +123,10 @@ close(ListenSocket) ->
         _ ->
             ok
     end,
-    socket:close(ListenSocket).
+    Result = socket:close(ListenSocket),
+    persistent_term:erase(?SOCKET_DIR_KEY),
+    persistent_term:erase(?ALLOWED_UIDS_KEY),
+    Result.
 
 -doc false.
 setopts(_ListenSocket, _Options) ->
@@ -103,19 +140,23 @@ getopts(_ListenSocket, _Options) ->
 %%% Path resolution and helpers
 %%% =====================================================================
 
-%% Resolve a node-name-without-host to a sockaddr_un path (binary). Reads
-%% the configured socket_dir from the application environment. A leading
-%% "@" on the configured dir selects the Linux abstract namespace.
+%% Resolve a node-name-without-host to a sockaddr_un path (binary). Reuses
+%% the path strategy selected by listen/1 when available, so outbound setup
+%% cannot drift if the environment changes after boot. A leading "@" on
+%% the configured dir selects the Linux abstract namespace.
 -doc false.
 resolve_path(Name) when is_list(Name) ->
-    %% Ensure the .app file is loaded so that -uds_dist socket_dir Path
-    %% args (resolved into app env at load time) are visible. Releases
-    %% load us via the boot script; ad-hoc invocations may not have.
-    _ = application:load(uds_dist),
-    Dir = unicode:characters_to_binary(
-            application:get_env(uds_dist, socket_dir, ".")),
+    Dir = persistent_term:get(?SOCKET_DIR_KEY, undefined),
+    resolve_path(Name, case Dir of
+                           undefined -> configured_socket_dir();
+                           _ -> Dir
+                       end).
+
+resolve_path(Name, Dir) ->
     NameBin = unicode:characters_to_binary(Name),
     Path = case Dir of
+        default_tmp ->
+            <<"/tmp/uds-dist-", NameBin/binary, ".sock">>;
         <<"@", Rest/binary>> ->
             true = abstract_supported() orelse
                 erlang:error({abstract_sockets_unsupported, os:type()}),
@@ -127,10 +168,155 @@ resolve_path(Name) when is_list(Name) ->
     end,
     validate_socket_path(Path).
 
+configured_socket_dir() ->
+    %% Ensure the .app file is loaded so that -uds_dist socket_dir Path
+    %% args (resolved into app env at load time) are visible. Releases
+    %% load us via the boot script; ad-hoc invocations may not have.
+    ok = ensure_application_loaded(),
+    case application:get_env(uds_dist, socket_dir) of
+        {ok, AppDir} -> normalize_socket_dir(AppDir);
+        undefined -> environment_socket_dir()
+    end.
+
+-doc false.
+configured_allowed_uids() ->
+    ok = ensure_application_loaded(),
+    Value = application:get_env(uds_dist, allowed_uids, default),
+    normalize_allowed_uids(Value).
+
+ensure_application_loaded() ->
+    case application:load(uds_dist) of
+        ok -> ok;
+        {error, {already_loaded, uds_dist}} -> ok;
+        {error, Reason} -> erlang:error({application_load_failed, Reason})
+    end.
+
+normalize_socket_dir(Value) ->
+    try unicode:characters_to_binary(Value) of
+        Dir when is_binary(Dir), byte_size(Dir) > 0 -> Dir;
+        _ -> erlang:error({invalid_socket_dir, Value})
+    catch
+        error:badarg -> erlang:error({invalid_socket_dir, Value})
+    end.
+
+normalize_allowed_uids(default) ->
+    normalize_uid_list([uds_dist_posix:effective_uid()]);
+normalize_allowed_uids(any) ->
+    any;
+normalize_allowed_uids(UIDs) when is_list(UIDs) ->
+    case lists:all(fun(UID) -> is_integer(UID) andalso UID >= 0 end, UIDs) of
+        true -> normalize_uid_list(UIDs);
+        false -> erlang:error({invalid_allowed_uids, UIDs})
+    end;
+normalize_allowed_uids(Value) ->
+    erlang:error({invalid_allowed_uids, Value}).
+
+normalize_uid_list(UIDs) ->
+    Normalized = lists:usort(UIDs),
+    case os:type() of
+        {unix, linux} -> reject_linux_overflow_uid(Normalized);
+        _ -> Normalized
+    end.
+
+reject_linux_overflow_uid([]) ->
+    [];
+reject_linux_overflow_uid(UIDs) ->
+    OverflowUID = linux_overflow_uid(),
+    case lists:member(OverflowUID, UIDs) of
+        true ->
+            erlang:error(
+              {invalid_allowed_uids,
+               {contains_linux_overflow_uid, OverflowUID, UIDs}});
+        false ->
+            UIDs
+    end.
+
+linux_overflow_uid() ->
+    Path = "/proc/sys/kernel/overflowuid",
+    case file:read_file(Path) of
+        {ok, Contents} ->
+            try binary_to_integer(string:trim(Contents)) of
+                UID when UID >= 0 -> UID;
+                _ -> erlang:error({invalid_linux_overflow_uid, Contents})
+            catch
+                error:badarg ->
+                    erlang:error({invalid_linux_overflow_uid, Contents})
+            end;
+        {error, Reason} ->
+            erlang:error({linux_overflow_uid_unavailable, Path, Reason})
+    end.
+
+environment_socket_dir() ->
+    case nonempty_env("UDS_DIST_DIR") of
+        {ok, Dir} -> normalize_socket_dir(Dir);
+        unset -> default_tmp
+    end.
+
+nonempty_env(Name) ->
+    case os:getenv(Name) of
+        false -> unset;
+        "" -> unset;
+        Value -> {ok, Value}
+    end.
+
+ensure_socket_dir(<<"@", _/binary>>) ->
+    ok;
+ensure_socket_dir(default_tmp) ->
+    ok;
+ensure_socket_dir(Dir) ->
+    case file:make_dir(Dir) of
+        ok ->
+            case file:change_mode(Dir, 8#755) of
+                ok -> validate_socket_dir(Dir);
+                {error, _} = Error -> Error
+            end;
+        {error, eexist} ->
+            validate_socket_dir(Dir);
+        {error, _} = Error ->
+            Error
+    end.
+
+validate_socket_dir(Dir) ->
+    case file:read_link_info(Dir, [raw]) of
+        {ok, #file_info{type = symlink}} ->
+            unsafe_socket_dir(Dir, symlink);
+        {ok, #file_info{type = Type}} when Type =/= directory ->
+            unsafe_socket_dir(Dir, not_directory);
+        {ok, #file_info{uid = ActualUID, mode = Mode}} ->
+            ExpectedUID = uds_dist_posix:effective_uid(),
+            validate_socket_dir_owner(Dir, ActualUID, ExpectedUID, Mode);
+        {error, _} = Error ->
+            Error
+    end.
+
+validate_socket_dir_owner(Dir, ActualUID, ExpectedUID, _Mode)
+  when ActualUID =/= ExpectedUID ->
+    unsafe_socket_dir(Dir, {not_owned, ActualUID, ExpectedUID});
+validate_socket_dir_owner(Dir, _ActualUID, _ExpectedUID, Mode) ->
+    Permissions = Mode band 8#777,
+    case Permissions of
+        8#755 -> ok;
+        _ -> unsafe_socket_dir(Dir, {unsafe_mode, Permissions})
+    end.
+
+unsafe_socket_dir(Dir, Reason) ->
+    {error, {unsafe_socket_dir, Dir, Reason}}.
+
 -doc false.
 abstract_supported() ->
     case os:type() of
         {unix, linux} -> true;
+        _ -> false
+    end.
+
+peer_credentials_supported() ->
+    case os:type() of
+        {unix, OS} when OS =:= linux;
+                        OS =:= darwin;
+                        OS =:= freebsd;
+                        OS =:= netbsd;
+                        OS =:= openbsd;
+                        OS =:= dragonfly -> true;
         _ -> false
     end.
 
@@ -149,16 +335,18 @@ validate_socket_path(Path) ->
             case Bytes =< Limit of
                 true -> Path;
                 false ->
-                    erlang:error(
-                      {socket_path_too_long,
-                       #{bytes => Bytes, max_bytes => Limit}})
+                    erlang:error({socket_path_too_long, Path, Limit})
             end
     end.
 
 socket_path_limit() ->
     case os:type() of
         {unix, linux} -> ?LINUX_SUN_PATH_BYTES;
-        {unix, darwin} -> ?DARWIN_SUN_PATH_BYTES;
+        {unix, OS} when OS =:= darwin;
+                        OS =:= freebsd;
+                        OS =:= netbsd;
+                        OS =:= openbsd;
+                        OS =:= dragonfly -> ?BSD_SUN_PATH_BYTES;
         _ -> undefined
     end.
 
@@ -177,9 +365,17 @@ open_and_bind(Path) ->
     {ok, S} = socket:open(local, stream, default),
     case socket:bind(S, sockaddr(Path)) of
         ok ->
-            Backlog = application:get_env(uds_dist, backlog, ?DEFAULT_BACKLOG),
-            ok = socket:listen(S, Backlog),
-            {ok, S};
+            case make_socket_connectable(Path) of
+                ok ->
+                    Backlog = application:get_env(uds_dist, backlog,
+                                                  ?DEFAULT_BACKLOG),
+                    ok = socket:listen(S, Backlog),
+                    {ok, S};
+                {error, _} = Error ->
+                    socket:close(S),
+                    maybe_unlink(Path),
+                    Error
+            end;
         {error, eaddrinuse} ->
             socket:close(S),
             handle_eaddrinuse(Path);
@@ -187,6 +383,14 @@ open_and_bind(Path) ->
             socket:close(S),
             Err
     end.
+
+make_socket_connectable(<<0, _/binary>>) ->
+    ok;
+make_socket_connectable(Path) ->
+    %% The configured owner-only directory, or /tmp's sticky bit for the
+    %% default, prevents other users from replacing a live socket entry.
+    %% Connection authorization uses kernel peer credentials in accept_loop/3.
+    file:change_mode(Path, 8#666).
 
 %% Distinguish a live duplicate from a stale socket file. For abstract
 %% sockets the kernel cleans up on close so eaddrinuse always means
@@ -241,22 +445,73 @@ maybe_unlink(Path) ->
 %%% =====================================================================
 
 -doc false.
-accept_loop(Kernel, ListenSocket) ->
+accept_loop(Kernel, ListenSocket, AllowedUIDs) ->
     case socket:accept(ListenSocket) of
         {ok, Socket} ->
-            %% Hand the handshake to a per-connection helper so the
-            %% loop can immediately re-enter socket:accept/1. Without
-            %% this the loop is serialised by the kernel handshake
-            %% round-trip and the listen backlog can overflow under
-            %% bursts of concurrent dialers.
-            _ = spawn_opt(?MODULE, accept_handshake, [Kernel, Socket],
-                          [{priority, max} | ?SPAWN_OPTS]),
-            accept_loop(Kernel, ListenSocket);
+            case authorize_peer(Socket, AllowedUIDs) of
+                {ok, _UID} ->
+                    %% Hand the handshake to a per-connection helper so the
+                    %% loop can immediately re-enter socket:accept/1. Without
+                    %% this the loop is serialised by the kernel handshake
+                    %% round-trip and the listen backlog can overflow under
+                    %% bursts of concurrent dialers.
+                    _ = spawn_opt(?MODULE, accept_handshake, [Kernel, Socket],
+                                  [{priority, max} | ?SPAWN_OPTS]);
+                {error, {peer_uid_not_allowed, _}} = Error ->
+                    maybe_log_rejection(warning,
+                                        "uds_dist rejected local peer",
+                                        Error),
+                    _ = socket:close(Socket);
+                {error, Reason} ->
+                    maybe_log_rejection(
+                      error, "uds_dist could not authorize local peer", Reason),
+                    _ = socket:close(Socket)
+            end,
+            accept_loop(Kernel, ListenSocket, AllowedUIDs);
         {error, closed} ->
             exit(closing_connection);
         Error ->
             exit(Error)
     end.
+
+authorize_peer(Socket, AllowedUIDs) ->
+    try uds_dist_posix:peer_effective_uid(Socket) of
+        {ok, UID} ->
+            case uid_allowed(UID, AllowedUIDs) of
+                true -> {ok, UID};
+                false -> {error, {peer_uid_not_allowed, UID}}
+            end;
+        {error, _} = Error ->
+            Error
+    catch
+        Class:Reason ->
+            {error, {peer_credential_exception, Class, Reason}}
+    end.
+
+uid_allowed(_UID, any) -> true;
+uid_allowed(UID, AllowedUIDs) -> lists:member(UID, AllowedUIDs).
+
+maybe_log_rejection(Level, Message, Reason) ->
+    Now = erlang:monotonic_time(millisecond),
+    Key = {?MODULE, rejection_log, Level},
+    case get(Key) of
+        undefined ->
+            put(Key, {Now, 0}),
+            logger:log(Level, "~s: ~tp", [Message, Reason]);
+        {LastLog, Suppressed}
+          when Now - LastLog >= ?REJECTION_LOG_INTERVAL_MS ->
+            put(Key, {Now, 0}),
+            log_rejection(Level, Message, Reason, Suppressed);
+        {LastLog, Suppressed} ->
+            put(Key, {LastLog, Suppressed + 1}),
+            ok
+    end.
+
+log_rejection(Level, Message, Reason, 0) ->
+    logger:log(Level, "~s: ~tp", [Message, Reason]);
+log_rejection(Level, Message, Reason, Suppressed) ->
+    logger:log(Level, "~s: ~tp (~B similar events suppressed)",
+               [Message, Reason, Suppressed]).
 
 -doc false.
 accept_handshake(Kernel, Socket) ->
@@ -302,29 +557,50 @@ accept_supervisor(Kernel, AcceptPid, DistCtrl, MyNode, Allowed, SetupTime) ->
 setup_supervisor(Kernel, Node, Type, MyNode, SetupTime) ->
     Name = strip_host(Node),
     Path = resolve_path(Name),
+    AllowedUIDs = selected_allowed_uids(),
     {ok, Socket} = socket:open(local, stream, default),
     case socket:connect(Socket, sockaddr(Path)) of
         ok ->
-            Timer = dist_util:start_timer(SetupTime),
-            DistCtrl = spawn_dist_controller(Socket),
-            call_controller(DistCtrl, {supervisor, self()}),
-            HSData = (hs_data_common(DistCtrl))#hs_data{
-                       kernel_pid = Kernel,
-                       other_node = Node,
-                       this_node = MyNode,
-                       socket = DistCtrl,
-                       timer = Timer,
-                       other_version = ?ERL_DIST_VER,
-                       request_type = Type,
-                       f_address = fun(_, _) ->
-                                           net_address(sockaddr_to_address(Path))
-                                   end
-                      },
-            dist_util:handshake_we_started(HSData);
-        {error, _} ->
+            case authorize_peer(Socket, AllowedUIDs) of
+                {ok, _UID} ->
+                    start_outbound_handshake(
+                      Kernel, Socket, Node, Type, MyNode, SetupTime, Path);
+                {error, Reason} ->
+                    socket:close(Socket),
+                    logger:warning(
+                      "uds_dist rejected server at ~tp: ~tp", [Path, Reason]),
+                    ?shutdown(Node)
+            end;
+        {error, Reason} ->
             socket:close(Socket),
+            logger:warning("uds_dist could not connect to ~tp: ~tp",
+                           [Path, Reason]),
             ?shutdown(Node)
     end.
+
+selected_allowed_uids() ->
+    case persistent_term:get(?ALLOWED_UIDS_KEY, undefined) of
+        undefined -> configured_allowed_uids();
+        AllowedUIDs -> AllowedUIDs
+    end.
+
+start_outbound_handshake(Kernel, Socket, Node, Type, MyNode, SetupTime, Path) ->
+    Timer = dist_util:start_timer(SetupTime),
+    DistCtrl = spawn_dist_controller(Socket),
+    call_controller(DistCtrl, {supervisor, self()}),
+    HSData = (hs_data_common(DistCtrl))#hs_data{
+               kernel_pid = Kernel,
+               other_node = Node,
+               this_node = MyNode,
+               socket = DistCtrl,
+               timer = Timer,
+               other_version = ?ERL_DIST_VER,
+               request_type = Type,
+               f_address = fun(_, _) ->
+                                   net_address(sockaddr_to_address(Path))
+                           end
+              },
+    dist_util:handshake_we_started(HSData).
 
 %%% =====================================================================
 %%% Handshake data record shared by accept and setup
