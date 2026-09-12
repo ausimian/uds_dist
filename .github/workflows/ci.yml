@@ -42,6 +42,14 @@ jobs:
             ${{ runner.os }}-mix-${{ matrix.otp }}-${{ matrix.elixir }}-
 
       - run: mix deps.get
+
+      - name: Build NIF with strict and inherited linker flags
+        run: |
+          mix clean
+          CPPFLAGS="-DUDS_DIST_CI_BUILD=1" LDFLAGS="-L/tmp" \
+            STRICT_CFLAGS="-Werror -Werror=implicit-function-declaration" \
+            mix compile --warnings-as-errors
+
       - run: mix precommit
       - run: mix test --only stress
 
@@ -55,11 +63,12 @@ jobs:
         working-directory: example/_build/prod/rel/example
         run: |
           ./bin/example daemon
+          socket="/tmp/uds-dist-example.sock"
           for _ in $(seq 1 20); do
-            [ -S example.sock ] && exit 0
+            [ -S "$socket" ] && exit 0
             sleep 0.5
           done
-          echo "example.sock never appeared" >&2
+          echo "$socket never appeared" >&2
           exit 1
 
       - name: RPC into example daemon
@@ -71,7 +80,66 @@ jobs:
 
       - name: Stop example daemon
         working-directory: example/_build/prod/rel/example
-        run: ./bin/example stop
+        run: |
+          ./bin/example stop
+          socket="/tmp/uds-dist-example.sock"
+          for _ in $(seq 1 20); do
+            [ ! -S "$socket" ] && exit 0
+            sleep 0.5
+          done
+          echo "socket remained after daemon shutdown: $socket" >&2
+          exit 1
+
+      - name: RPC as a different operating-system user
+        if: runner.os == 'Linux'
+        working-directory: example/_build/prod/rel/example
+        run: |
+          remote_user=daemon
+          remote_uid=$(id -u "$remote_user")
+          runner_uid=$(id -u)
+          trusted_uids="[$runner_uid,$remote_uid]"
+          release_cookie=$(cat releases/COOKIE)
+          remote_tmp="/tmp/uds-dist-remote-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remote_release="/tmp/uds-dist-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp -a . "$remote_release"
+          chmod -R a+rX "$remote_release"
+
+          ERL_FLAGS="-uds_dist allowed_uids $trusted_uids" \
+            ./bin/example daemon
+
+          cleanup() {
+            sudo -u "$remote_user" env RELEASE_COOKIE="$release_cookie" \
+              RELEASE_TMP="$remote_tmp" \
+              ERL_FLAGS="-uds_dist allowed_uids $trusted_uids" \
+              "$remote_release/bin/example" stop || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 20); do
+            [ -S /tmp/uds-dist-example.sock ] && break
+            sleep 0.5
+          done
+          [ -S /tmp/uds-dist-example.sock ]
+
+          if sudo -u "$remote_user" env RELEASE_COOKIE="$release_cookie" \
+            RELEASE_TMP="$remote_tmp" \
+            ERL_FLAGS="-uds_dist allowed_uids [$remote_uid]" \
+            "$remote_release/bin/example" rpc \
+            'IO.puts inspect(Example.hello())'; then
+            echo "RPC unexpectedly trusted a server outside allowed_uids" >&2
+            exit 1
+          fi
+
+          out=$(sudo -u "$remote_user" env RELEASE_COOKIE="$release_cookie" \
+            RELEASE_TMP="$remote_tmp" \
+            ERL_FLAGS="-uds_dist allowed_uids $trusted_uids" \
+            "$remote_release/bin/example" rpc \
+            'IO.puts inspect(Example.hello())')
+          echo "cross-uid rpc returned: $out"
+          [ "$out" = ":world" ]
+
+          cleanup
+          trap - EXIT
 
   publish:
     name: Publish to Hex.pm
