@@ -6,11 +6,29 @@ defmodule UdsDistPeerTest do
   setup do
     tmp = Path.join(System.tmp_dir!(), "uds_dist_peer_#{System.unique_integer([:positive])}")
     File.mkdir_p!(tmp)
+    File.chmod!(tmp, 0o755)
     on_exit(fn -> File.rm_rf!(tmp) end)
     %{tmp: tmp, ebin: to_charlist(:code.lib_dir(:uds_dist) |> Path.join("ebin"))}
   end
 
   describe "filesystem UDS distribution" do
+    test "two peers use deterministic default paths", ctx do
+      suffix = System.unique_integer([:positive])
+      name1 = :"default_alpha_#{suffix}"
+      name2 = :"default_beta_#{suffix}"
+      {:ok, p1, _n1} = start_peer(name1, :default, ctx.ebin)
+      {:ok, p2, n2} = start_peer(name2, :default, ctx.ebin)
+
+      try do
+        assert File.exists?("/tmp/uds-dist-#{name1}.sock")
+        assert File.exists?("/tmp/uds-dist-#{name2}.sock")
+        assert :peer.call(p1, :net_kernel, :connect_node, [n2]) == true
+      after
+        stop_peer(p2)
+        stop_peer(p1)
+      end
+    end
+
     test "two peers can connect and exchange messages", ctx do
       {:ok, p1, n1} = start_peer(:alpha, ctx.tmp, ctx.ebin)
       {:ok, p2, n2} = start_peer(:beta, ctx.tmp, ctx.ebin)
@@ -25,6 +43,90 @@ defmodule UdsDistPeerTest do
 
         assert File.exists?(Path.join(ctx.tmp, "alpha.sock"))
         assert File.exists?(Path.join(ctx.tmp, "beta.sock"))
+      after
+        stop_peer(p2)
+        stop_peer(p1)
+      end
+    end
+
+    test "a listener rejects a peer outside its allowed uid list", ctx do
+      {:ok, p1, _n1} = start_peer(:denied_a, ctx.tmp, ctx.ebin)
+      {:ok, p2, n2} = start_peer(:denied_b, ctx.tmp, ctx.ebin, [])
+
+      try do
+        assert :peer.call(p1, :net_kernel, :connect_node, [n2]) == false
+        assert :peer.call(p1, :erlang, :nodes, []) == []
+      after
+        stop_peer(p2)
+        stop_peer(p1)
+      end
+    end
+
+    test "an outbound-only peer rejects a server outside its allowed uid list", ctx do
+      {:ok, client, _client_node} =
+        start_peer(:outbound_denied_client, ctx.tmp, ctx.ebin, [], false)
+
+      {:ok, server, server_node} = start_peer(:outbound_denied_server, ctx.tmp, ctx.ebin, :any)
+
+      try do
+        refute File.exists?(Path.join(ctx.tmp, "outbound_denied_client.sock"))
+        assert :peer.call(client, :net_kernel, :connect_node, [server_node]) == false
+        assert :peer.call(client, :erlang, :nodes, []) == []
+      after
+        stop_peer(server)
+        stop_peer(client)
+      end
+    end
+
+    test "an outbound-only peer reads its policy without listener state", ctx do
+      uid = :uds_dist_posix.effective_uid()
+
+      {:ok, client, _client_node} =
+        start_peer(:outbound_allowed_client, ctx.tmp, ctx.ebin, [uid], false)
+
+      {:ok, server, server_node} = start_peer(:outbound_allowed_server, ctx.tmp, ctx.ebin, [uid])
+
+      try do
+        refute File.exists?(Path.join(ctx.tmp, "outbound_allowed_client.sock"))
+        assert :peer.call(client, :net_kernel, :connect_node, [server_node]) == true
+
+        assert :peer.call(client, :rpc, :call, [server_node, :erlang, :node, []]) ==
+                 server_node
+      after
+        stop_peer(server)
+        stop_peer(client)
+      end
+    end
+
+    test "any permits a local peer", ctx do
+      {:ok, p1, _n1} = start_peer(:any_a, ctx.tmp, ctx.ebin)
+      {:ok, p2, n2} = start_peer(:any_b, ctx.tmp, ctx.ebin, :any)
+
+      try do
+        assert :peer.call(p1, :net_kernel, :connect_node, [n2]) == true
+      after
+        stop_peer(p2)
+        stop_peer(p1)
+      end
+    end
+
+    test "outbound setup reuses the directory selected by listen", ctx do
+      {:ok, p1, _n1} = start_peer(:pinned_a, ctx.tmp, ctx.ebin)
+      {:ok, p2, n2} = start_peer(:pinned_b, ctx.tmp, ctx.ebin)
+
+      try do
+        changed_dir = Path.join(ctx.tmp, "changed_after_boot")
+
+        assert :peer.call(p1, :application, :set_env, [
+                 :uds_dist,
+                 :socket_dir,
+                 changed_dir
+               ]) == :ok
+
+        assert :peer.call(p1, :application, :set_env, [:uds_dist, :allowed_uids, []]) == :ok
+
+        assert :peer.call(p1, :net_kernel, :connect_node, [n2]) == true
+        assert :peer.call(p1, :erlang, :nodes, []) == [n2]
       after
         stop_peer(p2)
         stop_peer(p1)
@@ -244,28 +346,38 @@ defmodule UdsDistPeerTest do
     end
   end
 
-  defp start_peer(name, socket_dir, ebin) do
+  defp start_peer(name, socket_dir, ebin, allowed_uids \\ :default, dist_listen \\ true) do
+    socket_dir_args =
+      case socket_dir do
+        :default -> []
+        value -> [~c"-uds_dist", ~c"socket_dir", quote_erl_string(value)]
+      end
+
+    policy_args =
+      case allowed_uids do
+        :default -> []
+        value -> [~c"-uds_dist", ~c"allowed_uids", quote_erl_term(value)]
+      end
+
     {:ok, p, node} =
       :peer.start_link(%{
         name: name,
         connection: :standard_io,
-        args: [
-          ~c"-proto_dist",
-          ~c"uds",
-          ~c"-no_epmd",
-          ~c"-dist_listen",
-          ~c"true",
-          ~c"-setcookie",
-          ~c"uds_dist_test_cookie",
-          ~c"-pa",
-          ebin,
-          ~c"-uds_dist",
-          ~c"socket_dir",
-          quote_erl_string(socket_dir),
-          ~c"-uds_dist",
-          ~c"backlog",
-          ~c"128"
-        ]
+        args:
+          [
+            ~c"-proto_dist",
+            ~c"uds",
+            ~c"-no_epmd",
+            ~c"-dist_listen",
+            to_charlist(to_string(dist_listen)),
+            ~c"-setcookie",
+            ~c"uds_dist_test_cookie",
+            ~c"-pa",
+            ebin,
+            ~c"-uds_dist",
+            ~c"backlog",
+            ~c"128"
+          ] ++ socket_dir_args ++ policy_args
       })
 
     enable_peer_cover(p, name)
@@ -316,6 +428,10 @@ defmodule UdsDistPeerTest do
     # Erlang's -App Key Value parser evaluates Value as a term, so a string
     # must look like a quoted literal: "/tmp/foo" → `"\"/tmp/foo\""`.
     ~s("#{s}") |> to_charlist()
+  end
+
+  defp quote_erl_term(term) do
+    :io_lib.format(~c"~tp", [term]) |> IO.iodata_to_binary() |> to_charlist()
   end
 
   defp wait_until(fun, timeout_ms) do
