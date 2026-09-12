@@ -23,7 +23,7 @@ jobs:
           - elixir: '1.19'
             otp: '29'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: erlef/setup-beam@v1
         with:
@@ -31,7 +31,7 @@ jobs:
           elixir-version: ${{ matrix.elixir }}
           version-type: loose
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             deps
