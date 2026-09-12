@@ -18,12 +18,17 @@ defmodule UdsDist.MixProject do
       package: package(),
       docs: docs(),
       deps: deps(),
+      aliases: aliases(),
       test_coverage: [summary: [threshold: 70]]
     ]
   end
 
+  def cli do
+    [preferred_envs: [precommit: :test]]
+  end
+
   def application do
-    [extra_applications: [:kernel], env: [backlog: 5]]
+    [env: [backlog: 5]]
   end
 
   defp description do
@@ -50,8 +55,21 @@ defmodule UdsDist.MixProject do
 
   defp deps do
     [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
       {:publisho, "~> 1.0", only: :dev, runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "credo --strict",
+        "test"
+      ]
     ]
   end
 end

@@ -39,6 +39,8 @@ value at `listen/1` time (default 5).
 -define(ERL_DIST_VER, 6).
 -define(SPAWN_OPTS, [{message_queue_data, off_heap}, {fullsweep_after, 0}]).
 -define(DEFAULT_BACKLOG, 5).
+-define(LINUX_SUN_PATH_BYTES, 108).
+-define(DARWIN_SUN_PATH_BYTES, 104).
 
 %%% =====================================================================
 %%% Distribution callbacks
@@ -110,22 +112,54 @@ resolve_path(Name) when is_list(Name) ->
     %% args (resolved into app env at load time) are visible. Releases
     %% load us via the boot script; ad-hoc invocations may not have.
     _ = application:load(uds_dist),
-    case application:get_env(uds_dist, socket_dir, ".") of
-        [$@ | Rest] ->
+    Dir = unicode:characters_to_binary(
+            application:get_env(uds_dist, socket_dir, ".")),
+    NameBin = unicode:characters_to_binary(Name),
+    Path = case Dir of
+        <<"@", Rest/binary>> ->
             true = abstract_supported() orelse
                 erlang:error({abstract_sockets_unsupported, os:type()}),
             %% Abstract paths are signalled by a leading NUL byte and live
             %% in the kernel namespace, not the filesystem.
-            iolist_to_binary([0, Rest, "/", Name]);
-        Dir ->
-            iolist_to_binary(filename:join(Dir, Name ++ ".sock"))
-    end.
+            <<0, Rest/binary, "/", NameBin/binary>>;
+        _ ->
+            filename:join(Dir, <<NameBin/binary, ".sock">>)
+    end,
+    validate_socket_path(Path).
 
 -doc false.
 abstract_supported() ->
     case os:type() of
         {unix, linux} -> true;
         _ -> false
+    end.
+
+validate_socket_path(Path) ->
+    case socket_path_limit() of
+        undefined ->
+            Path;
+        Limit ->
+            %% Filesystem paths need a trailing NUL in sun_path. Linux
+            %% abstract names are length-delimited and already include their
+            %% leading NUL byte.
+            Bytes = case Path of
+                        <<0, _/binary>> -> byte_size(Path);
+                        _ -> byte_size(Path) + 1
+                    end,
+            case Bytes =< Limit of
+                true -> Path;
+                false ->
+                    erlang:error(
+                      {socket_path_too_long,
+                       #{bytes => Bytes, max_bytes => Limit}})
+            end
+    end.
+
+socket_path_limit() ->
+    case os:type() of
+        {unix, linux} -> ?LINUX_SUN_PATH_BYTES;
+        {unix, darwin} -> ?DARWIN_SUN_PATH_BYTES;
+        _ -> undefined
     end.
 
 -doc false.
@@ -164,8 +198,14 @@ handle_eaddrinuse(Path) ->
         alive ->
             {error, duplicate_name};
         stale ->
-            _ = file:delete(Path, [raw]),
-            open_and_bind(Path)
+            case file:delete(Path, [raw]) of
+                ok -> open_and_bind(Path);
+                %% Another process may have removed the same stale entry.
+                %% Retry the bind and let the next eaddrinuse probe decide
+                %% whether a new owner won the race.
+                {error, enoent} -> open_and_bind(Path);
+                {error, _} = Error -> Error
+            end
     end.
 
 probe(Path) ->
@@ -220,13 +260,17 @@ accept_loop(Kernel, ListenSocket) ->
 
 -doc false.
 accept_handshake(Kernel, Socket) ->
-    DistCtrl = spawn_dist_controller(Socket),
+    DistCtrl = spawn_dist_controller(Socket, [link]),
     Kernel ! {accept, self(), DistCtrl, local, stream},
     receive
         {Kernel, controller, SupervisorPid} ->
             call_controller(DistCtrl, {supervisor, SupervisorPid}),
             SupervisorPid ! {self(), controller};
         {Kernel, unsupported_protocol} ->
+            %% The accepted socket is owned by the long-lived accept loop,
+            %% so explicitly close it as well as terminating the linked
+            %% controller.
+            _ = socket:close(Socket),
             exit(unsupported_protocol)
     end.
 
@@ -327,8 +371,11 @@ hs_data_common(DistCtrl) ->
 %%% =====================================================================
 
 spawn_dist_controller(Socket) ->
+    spawn_dist_controller(Socket, []).
+
+spawn_dist_controller(Socket, ExtraOpts) ->
     spawn_opt(fun() -> setup_loop(Socket, undefined) end,
-              [{priority, max} | ?SPAWN_OPTS]).
+              ExtraOpts ++ [{priority, max} | ?SPAWN_OPTS]).
 
 setup_loop(Socket, Sup) ->
     receive
@@ -444,8 +491,7 @@ input_handler(DHandle, Socket, Sup) ->
 %% Greedy recv: pull whatever bytes are available in the kernel buffer, then
 %% extract as many complete frames as we can and carry any remainder into the
 %% next iteration. Reduces syscall count under burst traffic versus a pair of
-%% exact-size recvs per frame. BEAM's writable-binary optimisation keeps the
-%% Buf append amortised O(bytes received).
+%% exact-size recvs per frame.
 input_loop(DHandle, Socket, Buf) ->
     case socket:recv(Socket, 0, infinity) of
         {ok, Bytes} ->
@@ -470,17 +516,16 @@ deliver(DHandle, Body) ->
     end.
 
 %%% =====================================================================
-%%% Stats — derived from socket:info/1 counters. The values do not match
-%%% gen_tcp's send_cnt/recv_cnt one-to-one (these are byte counts, not
-%%% packet counts) but the dist ticker only cares that the numbers move
-%%% when traffic flows.
+%%% Stats — derived from socket:info/1 counters. read_pkg/write_pkg are the
+%%% counters used by OTP's socket-backed inet implementation for the legacy
+%%% recv_cnt/send_cnt values. The dist ticker only requires changing values.
 %%% =====================================================================
 
 socket_stats(Socket) ->
     case socket:info(Socket) of
         #{counters := Counters} ->
-            Recv = maps:get(read_byte, Counters, 0),
-            Sent = maps:get(write_byte, Counters, 0),
+            Recv = maps:get(read_pkg, Counters, 0),
+            Sent = maps:get(write_pkg, Counters, 0),
             {ok, Recv, Sent, 0};
         _ ->
             {ok, 0, 0, 0}
