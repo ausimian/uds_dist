@@ -1,5 +1,6 @@
 ### Changed
 
+- Publish tagged package versions to Hex.pm after the complete CI matrix passes.
 - Require Erlang/OTP 27 or newer, matching the Erlang syntax used by the library.
 - Report distribution socket statistics as packet counts, consistent with OTP's `recv_cnt` and `send_cnt` semantics.
 

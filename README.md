@@ -125,6 +125,31 @@ end
 
 Start a second node the same way with a different `--sname` and run `Node.connect/1` from either side. Releases do not need this workaround — the boot script populates the code path before `-proto_dist` is consulted.
 
+## Publishing to Hex.pm
+
+CI publishes the package and its documentation to Hex.pm when a bare version tag such as `1.1.0` is pushed. The publish job waits for the complete test matrix and rejects the release unless:
+
+- the tagged commit is on `main`
+- the tag exactly matches the `@version` value in `mix.exs`
+- the `HEX_API_KEY` repository secret is configured
+
+Create a dedicated API key from the [Hex.pm keys dashboard](https://hex.pm/dashboard/keys):
+
+1. Sign in with a Hex.pm account that owns or maintains the `uds_dist` package.
+2. Select **Generate New Key**.
+3. Name it `uds-dist-github-actions`, choose an appropriate expiry, and grant only **API → Write** permission.
+4. Copy the key when shown; Hex.pm displays it only once.
+5. In the GitHub repository, open **Settings → Secrets and variables → Actions**, create a repository secret named `HEX_API_KEY`, and paste the key as its value.
+
+Never commit or print the key. Revoke it from the Hex.pm dashboard and replace the GitHub secret if it is exposed or no longer needed.
+
+To release, update `RELEASE.md`, then use `mix publisho <level>` to update the version, changelog, commit, and bare version tag. Review the result before pushing both the branch and tag:
+
+```sh
+git push
+git push --tags
+```
+
 ## How it works
 
 `uds_dist` implements the seven callbacks an Erlang distribution module must export (`listen/1`, `accept/1`, `accept_connection/5`, `setup/5`, `close/1`, `select/1`, `address/0`) against the `:socket` NIF rather than `gen_tcp`. EPMD is bypassed entirely: `setup/5` derives the target's socket path from the node name plus the configured `socket_dir`, so no registry is needed.
