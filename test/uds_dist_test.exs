@@ -21,7 +21,7 @@ defmodule UdsDistTest do
 
   describe "select/1" do
     test "returns true for any node name" do
-      assert :uds_dist.select(:"foo@bar") == true
+      assert :uds_dist.select(:foo@bar) == true
       assert :uds_dist.select(:"name@127.0.0.1") == true
       assert :uds_dist.select(:bare) == true
     end
@@ -36,7 +36,7 @@ defmodule UdsDistTest do
 
   describe "strip_host/1" do
     test "drops everything from @ onwards on shortnames" do
-      assert :uds_dist.strip_host(:"node@host") == ~c"node"
+      assert :uds_dist.strip_host(:node@host) == ~c"node"
     end
 
     test "drops everything from @ onwards on longnames" do
@@ -64,11 +64,29 @@ defmodule UdsDistTest do
     end
 
     @tag :linux_only
-    test "produces an abstract path for socket_dir starting with @" do
-      Application.put_env(:uds_dist, :socket_dir, ~c"@uds_dist_test")
+    test "produces an abstract path for a binary socket_dir starting with @" do
+      Application.put_env(:uds_dist, :socket_dir, "@uds_dist_test")
 
       path = :uds_dist.resolve_path(~c"node")
       assert <<0, "uds_dist_test/node">> == path
+    end
+
+    test "continues to accept charlist socket_dir values" do
+      Application.put_env(:uds_dist, :socket_dir, ~c"uds_dist_test")
+
+      assert :uds_dist.resolve_path(~c"node") == "uds_dist_test/node.sock"
+    end
+
+    test "raises a descriptive error for an overlong socket path" do
+      Application.put_env(:uds_dist, :socket_dir, String.duplicate("x", 108))
+
+      error =
+        assert_raise ErlangError, ~r/socket_path_too_long/, fn ->
+          :uds_dist.resolve_path(~c"node")
+        end
+
+      assert {:socket_path_too_long, %{bytes: bytes, max_bytes: max_bytes}} = error.original
+      assert bytes > max_bytes
     end
 
     test "raises on non-linux when abstract is requested" do
@@ -146,6 +164,14 @@ defmodule UdsDistTest do
       :ok = :uds_dist.close(listen)
     end
 
+    test "a stale entry that cannot be deleted returns the delete error", %{tmp: tmp} do
+      blocked = Path.join(tmp, "blocked.sock")
+      File.mkdir!(blocked)
+
+      assert {:error, reason} = :uds_dist.listen(:blocked)
+      assert reason in [:eacces, :eisdir, :eperm]
+    end
+
     @tag :linux_only
     test "abstract sockets bind and close without a filesystem entry" do
       Application.put_env(:uds_dist, :socket_dir, ~c"@uds_dist_test_abs")
@@ -154,6 +180,26 @@ defmodule UdsDistTest do
       assert {:net_address, {:local, <<0, "uds_dist_test_abs/abs1">>}, _, _, _} = addr
 
       :ok = :uds_dist.close(listen)
+    end
+  end
+
+  describe "accept_handshake/2" do
+    test "closes the controller and socket when the kernel rejects the protocol" do
+      {:ok, socket} = :socket.open(:local, :stream, :default)
+      helper = spawn(:uds_dist, :accept_handshake, [self(), socket])
+
+      assert_receive {:accept, ^helper, controller, :local, :stream}
+      helper_ref = Process.monitor(helper)
+      controller_ref = Process.monitor(controller)
+
+      send(helper, {self(), :unsupported_protocol})
+
+      assert_receive {:DOWN, ^helper_ref, :process, ^helper, :unsupported_protocol}
+      assert_receive {:DOWN, ^controller_ref, :process, ^controller, :unsupported_protocol}
+
+      info = :socket.info(socket)
+      assert :closed in info.rstates
+      assert :closed in info.wstates
     end
   end
 end

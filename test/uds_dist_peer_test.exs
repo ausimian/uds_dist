@@ -315,7 +315,7 @@ defmodule UdsDistPeerTest do
   defp quote_erl_string(s) do
     # Erlang's -App Key Value parser evaluates Value as a term, so a string
     # must look like a quoted literal: "/tmp/foo" → `"\"/tmp/foo\""`.
-    (~s("#{s}")) |> to_charlist()
+    ~s("#{s}") |> to_charlist()
   end
 
   defp wait_until(fun, timeout_ms) do

@@ -6,7 +6,7 @@ Filesystem-backed sockets work on any Unix-like platform. Linux additionally sup
 
 ## Requirements
 
-OTP 26 or newer. Erlang distribution protocol version 6 only.
+OTP 27 or newer. Erlang distribution protocol version 6 only.
 
 ## Installation
 
@@ -36,6 +36,10 @@ A node named `myapp@host` then listens at `/run/myapp/myapp.sock`. Anything afte
 
 If `socket_dir` is omitted the default is `"."`, meaning sockets are created relative to the BEAM's working directory. Convenient for ad-hoc testing; not recommended for releases.
 
+On Linux and macOS, `uds_dist` validates the encoded Unix socket address before opening it and raises a `socket_path_too_long` error containing the actual and maximum sizes when it will not fit the platform's `sockaddr_un` representation.
+
+When a filesystem socket is left behind by an abrupt shutdown, `uds_dist` probes it and removes it if it is stale. The probe-and-remove sequence cannot be atomic: concurrent attempts to start the same node name can race. Serialize starts for a given node name through the service manager.
+
 ### Abstract namespace sockets (Linux only)
 
 A `socket_dir` value beginning with `@` selects the Linux abstract namespace. Abstract sockets have no filesystem entry, no permission bits, and are cleaned up by the kernel when their owner exits.
@@ -47,6 +51,12 @@ config :uds_dist, socket_dir: "@myapp"
 A node named `myapp@host` then listens at the abstract path `\0myapp/myapp`.
 
 Configuring an abstract `socket_dir` on a non-Linux platform raises at `listen/1` or `setup/5` time. There is no automatic fallback.
+
+### Security
+
+For filesystem sockets, create a directory owned by the release user with mode `0700` and point `socket_dir` at it. Directory permissions provide a stronger portability boundary than relying on the socket file's own mode.
+
+Abstract sockets have no permission bits. Any local process can reach them, so the Erlang distribution cookie is the only authentication boundary. Use a strong, deployment-specific cookie and protect it like a credential.
 
 ### Listen backlog
 
